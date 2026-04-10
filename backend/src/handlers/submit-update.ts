@@ -11,10 +11,13 @@ import { assessUpdate } from '../services/ai-assessor.js';
 import { SubmitUpdateRequestSchema } from '../schemas/update.js';
 import {
   calculateCurrentDepth,
-  calculateRaisePercent,
-  TIER_SINK_RATE_PER_MS,
-} from '@sink-board/shared';
-import type { SubmitUpdateRequest, SubmitUpdateResponse, TaskUpdate } from '@sink-board/shared';
+  calculateRaisePerc,
+  depthCheck,
+} from '../utils/depth.js';
+import { log } from '../utils/logger.js';
+import type { SubmitUpdateRequest, TaskUpdate } from '@sink-board/shared';
+
+const DEFAULT_ASSESSMENT_SCORE = 29;
 
 export const handler = validateBody(
   SubmitUpdateRequestSchema,
@@ -22,106 +25,99 @@ export const handler = validateBody(
     event: APIGatewayProxyEventV2,
     body: SubmitUpdateRequest,
   ): Promise<APIGatewayProxyResultV2> => {
-    try {
-      const userId = getUserId(event);
-      const taskId = event.pathParameters?.id;
+    const userId = getUserId(event);
+    const taskId = event.pathParameters?.taskId;
 
-      if (!taskId) {
-        return {
-          statusCode: 400,
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ error: 'Missing task id in path' }),
-        };
-      }
-
-      const task = await getTask(userId, taskId);
-
-      if (!task) {
-        return {
-          statusCode: 404,
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ error: 'Task not found' }),
-        };
-      }
-
-      if (task.userId !== userId) {
-        return {
-          statusCode: 403,
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ error: 'Forbidden' }),
-        };
-      }
-
-      if (task.status !== 'active') {
-        return {
-          statusCode: 400,
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ error: 'Task is not active' }),
-        };
-      }
-
-      // AI assessment
-      const assessment = await assessUpdate(
-        task.title,
-        task.description,
-        body.content,
-      );
-
-      const raisePercent = calculateRaisePercent(assessment.score);
-
-      // Calculate current depth including time-based sinking
-      const currentDepth = calculateCurrentDepth(
-        task.currentDepthPercent,
-        task.lastRaisedAt,
-        TIER_SINK_RATE_PER_MS[task.sizeTier],
-      );
-
-      // Apply raise
-      const newDepth = Math.max(0, currentDepth - raisePercent);
-      const now = new Date().toISOString();
-
-      // Persist task update
-      await updateTaskAfterRaise(userId, taskId, newDepth, now);
-
-      // Write update record
-      const updateId = crypto.randomUUID();
-      const taskUpdate: TaskUpdate = {
-        updateId,
-        taskId,
-        userId,
-        content: body.content,
-        aiScore: assessment.score,
-        raisePercent,
-        createdAt: now,
-      };
-      await putTaskUpdate(taskUpdate);
-
-      const response: SubmitUpdateResponse = {
-        update: taskUpdate,
-        newDepthPercent: newDepth,
-        aiScore: assessment.score,
-        raisePercent,
-      };
-
+    if (!taskId) {
       return {
-        statusCode: 200,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(response),
-      };
-    } catch (err: any) {
-      if (err.statusCode === 401) {
-        return {
-          statusCode: 401,
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ error: err.message }),
-        };
-      }
-      console.error('submit-update error', err);
-      return {
-        statusCode: 500,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ error: 'Internal server error' }),
+        statusCode: 400,
+        body: JSON.stringify({ error: 'taskId is required' }),
       };
     }
+
+    const task = await getTask(taskId, userId);
+    if (!task) {
+      return {
+        statusCode: 404,
+        body: JSON.stringify({ error: 'Task not found' }),
+      };
+    }
+
+    if (task.userId !== userId) {
+      return {
+        statusCode: 403,
+        body: JSON.stringify({ error: 'Not authorized to update this task' }),
+      };
+    }
+
+    const updateId = crypto.randomUUID();
+    const timestamp = new Date().toISOString();
+
+    let assessmentScore = DEFAULT_ASSESSMENT_SCORE;
+    let assessmentError: string | undefined;
+
+    try {
+      const assessment = await assessUpdate({
+        taskTitle: task.title,
+        taskDescription: task.description || '',
+        updateText: body.updateText,
+      });
+      assessmentScore = assessment.score;
+    } catch (error) {
+      log('warn', 'Assessment scoring failed, using default score', {
+        taskId,
+        updateId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      assessmentError = 'Assessment scoring is unavailable. Assigning default score.';
+    }
+
+    const currentDepth = calculateCurrentDepth(task);
+    const raisePerc = calculateRaisePerc(assessmentScore);
+    const newDepth = Math.max(0, currentDepth - raisePerc);
+
+    const update: TaskUpdate = {
+      updateId,
+      taskId,
+      userId,
+      updateText: body.updateText,
+      timestamp,
+      assessmentScore,
+      raisePerc,
+      depthBefore: currentDepth,
+      depthAfter: newDepth,
+    };
+
+    await putTaskUpdate(update);
+
+    const krakenTook = depthCheck(newDepth, task.sizeTier);
+    const updatedTask = await updateTaskAfterRaise(
+      taskId,
+      userId,
+      newDepth,
+      krakenTook,
+      timestamp,
+    );
+
+    if (!updatedTask) {
+      return {
+        statusCode: 500,
+        body: JSON.stringify({ error: 'Failed to update task' }),
+      };
+    }
+
+    const responseBody: any = {
+      task: updatedTask,
+      update,
+    };
+
+    if (assessmentError) {
+      responseBody.warning = assessmentError;
+    }
+
+    return {
+      statusCode: 200,
+      body: JSON.stringify(responseBody),
+    };
   },
 );

@@ -1,44 +1,46 @@
-import { StrictMode } from 'react';
-import { createRoot } from 'react-dom/client';
-import { BrowserRouter } from 'react-router-dom';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { AuthProviderWithCallback, useAuth } from './auth/AuthProvider';
-import { configureApiClient } from './api/client';
-import App from './App';
-import './styles/global.css';
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import * as Sentry from '@sentry/react';
+import App from './App.tsx';
+import './index.css';
 
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      retry: 1,
-      refetchOnWindowFocus: true,
+// Initialize Sentry for error tracking
+if (import.meta.env.PROD && import.meta.env.VITE_SENTRY_DSN) {
+  Sentry.init({
+    dsn: import.meta.env.VITE_SENTRY_DSN,
+    environment: import.meta.env.MODE,
+    integrations: [
+      Sentry.browserTracingIntegration(),
+      Sentry.replayIntegration({
+        maskAllText: true,
+        blockAllMedia: true,
+      }),
+    ],
+    tracesSampleRate: 0.1,
+    replaysSessionSampleRate: 0.1,
+    replaysOnErrorSampleRate: 1.0,
+    beforeSend(event, hint) {
+      // Filter out non-critical errors
+      const error = hint.originalException;
+      if (error instanceof Error) {
+        // Don't send assessment scoring defaults (expected behavior)
+        if (error.message.includes('Assessment scoring is unavailable')) {
+          return null;
+        }
+      }
+      return event;
     },
-  },
-});
-
-/**
- * Bridges auth context into the imperative API client.
- * Rendered inside AuthProvider so useAuth() is available.
- */
-function ApiClientConfigurator() {
-  const { getIdToken, logout } = useAuth();
-  configureApiClient(getIdToken, logout);
-  return null;
+  });
 }
 
-function Root() {
-  return (
-    <StrictMode>
-      <BrowserRouter>
-        <QueryClientProvider client={queryClient}>
-          <AuthProviderWithCallback>
-            <ApiClientConfigurator />
-            <App />
-          </AuthProviderWithCallback>
-        </QueryClientProvider>
-      </BrowserRouter>
-    </StrictMode>
-  );
+const root = document.getElementById('root');
+
+if (!root) {
+  throw new Error('Root element not found');
 }
 
-createRoot(document.getElementById('root')!).render(<Root />);
+ReactDOM.createRoot(root).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
+);

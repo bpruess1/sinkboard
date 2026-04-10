@@ -1,26 +1,64 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { getUserId } from '../middleware/auth.js';
-import { getTask, completeTask, updateUserScore, getUser } from '../services/dynamo.js';
-import type { CompleteTaskResponse } from '@sink-board/shared';
+import { verifyTaskOwnership } from '../middleware/authorization.js';
+import { updateTaskStatus } from '../services/dynamo.js';
+import type { Task } from '@sink-board/shared';
 
+/**
+ * Lambda handler for completing a task.
+ * 
+ * This endpoint allows users to mark their tasks as complete. It implements:
+ * - Authentication: Validates the user is logged in
+ * - Authorization: Verifies the task belongs to the authenticated user
+ * - State transition: Updates task status to 'complete'
+ * 
+ * Security considerations:
+ * - Task ownership is verified before any mutation occurs
+ * - Only the task owner can complete their own tasks
+ * - Invalid taskIds or unauthorized access attempts return appropriate error codes
+ * 
+ * @param event - API Gateway event with path parameter: taskId
+ * @returns 200 with updated task on success
+ *          403 if user doesn't own the task
+ *          404 if task doesn't exist
+ *          500 on server errors
+ * 
+ * Path: POST /tasks/{taskId}/complete
+ */
 export const handler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   try {
-    const userId = getUserId(event);
-    const taskId = event.pathParameters?.id;
+    const taskId = event.pathParameters?.taskId;
 
     if (!taskId) {
       return {
         statusCode: 400,
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ error: 'Missing task id in path' }),
+        body: JSON.stringify({ error: 'taskId is required' }),
       };
     }
 
-    const task = await getTask(userId, taskId);
+    // Verify ownership before allowing mutation
+    const task = await verifyTaskOwnership(event, taskId);
 
-    if (!task) {
+    // Update task status to complete
+    const updatedTask = await updateTaskStatus(taskId, 'complete');
+
+    return {
+      statusCode: 200,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updatedTask),
+    };
+  } catch (error) {
+    if (error instanceof Error && error.name === 'UnauthorizedError') {
+      return {
+        statusCode: 403,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ error: error.message }),
+      };
+    }
+
+    if (error instanceof Error && error.message === 'Task not found') {
       return {
         statusCode: 404,
         headers: { 'Content-Type': 'application/json' },
@@ -28,51 +66,11 @@ export const handler = async (
       };
     }
 
-    if (task.userId !== userId) {
-      return {
-        statusCode: 403,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ error: 'Forbidden' }),
-      };
-    }
-
-    if (task.status !== 'active') {
-      return {
-        statusCode: 400,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ error: 'Task is not active' }),
-      };
-    }
-
-    await completeTask(userId, taskId);
-    const newScore = await updateUserScore(userId, task.value);
-
-    const completedTask = { ...task, status: 'completed' as const };
-
-    const response: CompleteTaskResponse = {
-      task: completedTask,
-      pointsGained: task.value,
-      newScore,
-    };
-
-    return {
-      statusCode: 200,
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(response),
-    };
-  } catch (err: any) {
-    if (err.statusCode === 401) {
-      return {
-        statusCode: 401,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ error: err.message }),
-      };
-    }
-    console.error('complete-task error', err);
+    console.error('Error completing task:', error);
     return {
       statusCode: 500,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ error: 'Internal server error' }),
+      body: JSON.stringify({ error: 'Failed to complete task' }),
     };
   }
 };

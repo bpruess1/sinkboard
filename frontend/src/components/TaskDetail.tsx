@@ -1,28 +1,57 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { apiClient } from '../lib/api-client';
 import type { Task, TaskUpdate } from '@sink-board/shared';
 
-const TaskDetail: React.FC = () => {
+const STATUS_LABELS: Record<string, string> = {
+  'open': 'Open',
+  'processing': 'Processing Assessment',
+  'ready for review': 'Ready for Review',
+  'completed': 'Completed',
+};
+
+export const TaskDetail: React.FC = () => {
   const { taskId } = useParams<{ taskId: string }>();
   const navigate = useNavigate();
   const [task, setTask] = useState<Task | null>(null);
   const [updates, setUpdates] = useState<TaskUpdate[]>([]);
-  const [updateText, setUpdateText] = useState('');
   const [loading, setLoading] = useState(true);
-  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [warning, setWarning] = useState<string | null>(null);
+  const [assessmentError, setAssessmentError] = useState<string | null>(null);
 
   useEffect(() => {
-    loadTask();
+    const fetchTaskAndUpdates = async () => {
+      if (!taskId) return;
+
+      try {
+        setLoading(true);
+        const [taskData, updatesData] = await Promise.all([
+          apiClient.getTask(taskId),
+          apiClient.getTaskUpdates(taskId),
+        ]);
+        setTask(taskData);
+        setUpdates(updatesData);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to load task');
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchTaskAndUpdates();
   }, [taskId]);
 
-  const loadTask = async () => {
+  const handleSubmitUpdate = async (content: string, hoursSpent: number) => {
     if (!taskId) return;
+
     try {
-      setLoading(true);
-      setError(null);
+      setAssessmentError(null);
+      const response = await apiClient.submitUpdate(taskId, { content, hoursSpent });
+      
+      if (response.errorMessage) {
+        setAssessmentError(response.errorMessage);
+      }
+
       const [taskData, updatesData] = await Promise.all([
         apiClient.getTask(taskId),
         apiClient.getTaskUpdates(taskId),
@@ -30,117 +59,106 @@ const TaskDetail: React.FC = () => {
       setTask(taskData);
       setUpdates(updatesData);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load task');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleSubmitUpdate = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!taskId || !updateText.trim()) return;
-
-    try {
-      setSubmitting(true);
-      setError(null);
-      setWarning(null);
-      const response = await apiClient.submitUpdate(taskId, { updateText: updateText.trim() });
-      setTask(response.task);
-      setUpdates([response.update, ...updates]);
-      setUpdateText('');
-      
-      if (response.warning) {
-        setWarning(response.warning);
-      }
-    } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to submit update');
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const handleCompleteTask = async () => {
-    if (!taskId || !confirm('Mark this task as complete?')) return;
-    try {
-      await apiClient.completeTask(taskId);
-      navigate('/');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to complete task');
     }
   };
 
   if (loading) return <div>Loading...</div>;
-  if (error && !task) return <div style={{ color: 'red' }}>Error: {error}</div>;
+  if (error) return <div>Error: {error}</div>;
   if (!task) return <div>Task not found</div>;
 
-  return (
-    <div style={{ maxWidth: '800px', margin: '0 auto', padding: '20px' }}>
-      <button onClick={() => navigate('/')} style={{ marginBottom: '20px' }}>
-        ← Back to Tasks
-      </button>
+  const statusLabel = STATUS_LABELS[task.status] || task.status;
 
+  return (
+    <div>
+      <button onClick={() => navigate('/tasks')}>← Back to Tasks</button>
       <h1>{task.title}</h1>
       {task.description && <p>{task.description}</p>}
       <p>
-        <strong>Size:</strong> {task.sizeTier} | <strong>Depth:</strong> {task.currentDepth.toFixed(1)}%
+        <strong>Status:</strong> {statusLabel}
       </p>
       <p>
-        <strong>Status:</strong> {task.krakenTook ? '🐙 Kraken Took' : task.status}
+        <strong>Size:</strong> {task.sizeTier}
+      </p>
+      <p>
+        <strong>Hours Spent:</strong> {task.totalHoursSpent}
       </p>
 
-      {warning && (
-        <div style={{ padding: '12px', backgroundColor: '#fff3cd', border: '1px solid #ffc107', borderRadius: '4px', marginBottom: '20px' }}>
-          ⚠️ {warning}
+      {assessmentError && (
+        <div style={{ padding: '12px', backgroundColor: '#fff3cd', border: '1px solid #ffc107', borderRadius: '4px', marginBottom: '16px' }}>
+          {assessmentError}
         </div>
-      )}
-
-      {error && (
-        <div style={{ padding: '12px', backgroundColor: '#f8d7da', border: '1px solid #dc3545', borderRadius: '4px', marginBottom: '20px' }}>
-          {error}
-        </div>
-      )}
-
-      {task.status === 'in_progress' && !task.krakenTook && (
-        <form onSubmit={handleSubmitUpdate} style={{ marginBottom: '30px' }}>
-          <textarea
-            value={updateText}
-            onChange={(e) => setUpdateText(e.target.value)}
-            placeholder="What progress have you made?"
-            rows={4}
-            style={{ width: '100%', padding: '8px', marginBottom: '10px' }}
-            disabled={submitting}
-          />
-          <button type="submit" disabled={submitting || !updateText.trim()}>
-            {submitting ? 'Submitting...' : 'Submit Update'}
-          </button>
-        </form>
-      )}
-
-      {task.status === 'in_progress' && !task.krakenTook && (
-        <button onClick={handleCompleteTask} style={{ marginBottom: '30px' }}>
-          Complete Task
-        </button>
       )}
 
       <h2>Updates</h2>
       {updates.length === 0 ? (
-        <p>No updates yet.</p>
+        <p>No updates yet</p>
       ) : (
-        <ul style={{ listStyle: 'none', padding: 0 }}>
+        <ul>
           {updates.map((update) => (
-            <li key={update.updateId} style={{ marginBottom: '20px', padding: '15px', border: '1px solid #ddd', borderRadius: '4px' }}>
-              <p>{update.updateText}</p>
-              <small>
-                Score: {update.assessmentScore}% | Raise: {update.raisePerc.toFixed(1)}% | Depth: {update.depthBefore.toFixed(1)}% → {update.depthAfter.toFixed(1)}%
-              </small>
-              <br />
-              <small>{new Date(update.timestamp).toLocaleString()}</small>
+            <li key={update.updateId}>
+              <p>{update.content}</p>
+              <p>
+                <strong>Hours:</strong> {update.hoursSpent} | <strong>Score:</strong>{' '}
+                {update.assessmentScore}%
+              </p>
+              {update.assessmentFeedback && <p><em>{update.assessmentFeedback}</em></p>}
             </li>
           ))}
         </ul>
+      )}
+
+      {task.status !== 'completed' && (
+        <UpdateForm onSubmit={handleSubmitUpdate} />
       )}
     </div>
   );
 };
 
-export default TaskDetail;
+interface UpdateFormProps {
+  onSubmit: (content: string, hoursSpent: number) => Promise<void>;
+}
+
+const UpdateForm: React.FC<UpdateFormProps> = ({ onSubmit }) => {
+  const [content, setContent] = useState('');
+  const [hoursSpent, setHoursSpent] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!content.trim() || !hoursSpent) return;
+
+    setSubmitting(true);
+    try {
+      await onSubmit(content, parseFloat(hoursSpent));
+      setContent('');
+      setHoursSpent('');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <h3>Submit Update</h3>
+      <textarea
+        value={content}
+        onChange={(e) => setContent(e.target.value)}
+        placeholder="Describe your progress..."
+        required
+      />
+      <input
+        type="number"
+        step="0.5"
+        min="0"
+        value={hoursSpent}
+        onChange={(e) => setHoursSpent(e.target.value)}
+        placeholder="Hours spent"
+        required
+      />
+      <button type="submit" disabled={submitting}>
+        {submitting ? 'Submitting...' : 'Submit Update'}
+      </button>
+    </form>
+  );
+};

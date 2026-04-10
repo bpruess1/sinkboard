@@ -1,67 +1,93 @@
-import Anthropic from '@anthropic-ai/sdk';
-import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
-import { ANTHROPIC_KEY_PARAM } from '@sink-board/shared';
+import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
+import { logger } from '../utils/logger.js';
+import type { TaskUpdate, Task } from '@sink-board/shared';
 
-const ssm = new SSMClient({});
+const sqs = new SQSClient({});
+const ASSESSMENT_QUEUE_URL = process.env.ASSESSMENT_QUEUE_URL!;
 
-let cachedApiKey: string | undefined;
-
-async function getApiKey(): Promise<string> {
-  if (cachedApiKey) return cachedApiKey;
-  const result = await ssm.send(
-    new GetParameterCommand({
-      Name: ANTHROPIC_KEY_PARAM,
-      WithDecryption: true,
-    }),
-  );
-  cachedApiKey = result.Parameter!.Value!;
-  return cachedApiKey;
+export interface AssessmentRequest {
+  taskId: string;
+  updateId: string;
+  userId: string;
+  updateContent: string;
+  taskTitle: string;
+  taskDescription?: string;
+  currentDepth: number;
 }
 
-interface AssessmentResult {
-  score: number;
-  reason: string;
+export interface AssessmentResult {
+  approved: boolean;
+  aiNotes: string;
+  confidence: number;
 }
 
-const SYSTEM_PROMPT =
-  'You are a task update quality assessor. Given a task and a user\'s progress update, score the quality from 0.0 to 1.0. Criteria: specificity (mentions concrete actions taken), progress (shows meaningful work done), substance (not filler/fluff). Return ONLY valid JSON: {"score": number, "reason": "brief explanation"}';
-
-export async function assessUpdate(
-  taskTitle: string,
-  taskDescription: string,
-  updateContent: string,
-): Promise<AssessmentResult> {
-  const fallback: AssessmentResult = { score: 0.5, reason: 'Unable to assess' };
+/**
+ * Publishes an assessment request to SQS for asynchronous processing
+ * Returns immediately without waiting for AI assessment
+ */
+export async function queueAssessment(
+  task: Task,
+  update: TaskUpdate,
+  currentDepth: number,
+): Promise<void> {
+  const request: AssessmentRequest = {
+    taskId: task.taskId,
+    updateId: update.updateId,
+    userId: task.userId,
+    updateContent: update.content,
+    taskTitle: task.title,
+    taskDescription: task.description,
+    currentDepth,
+  };
 
   try {
-    const apiKey = await getApiKey();
-    const anthropic = new Anthropic({ apiKey });
-
-    const response = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20241022',
-      max_tokens: 150,
-      system: SYSTEM_PROMPT,
-      messages: [
-        {
-          role: 'user',
-          content: `Task: ${taskTitle}\nDescription: ${taskDescription}\nUpdate: ${updateContent}`,
+    const command = new SendMessageCommand({
+      QueueUrl: ASSESSMENT_QUEUE_URL,
+      MessageBody: JSON.stringify(request),
+      MessageAttributes: {
+        taskId: {
+          DataType: 'String',
+          StringValue: task.taskId,
         },
-      ],
+        userId: {
+          DataType: 'String',
+          StringValue: task.userId,
+        },
+      },
     });
 
-    const text =
-      response.content[0].type === 'text' ? response.content[0].text : '';
-    const parsed = JSON.parse(text);
+    const result = await sqs.send(command);
 
-    if (typeof parsed.score !== 'number' || typeof parsed.reason !== 'string') {
-      return fallback;
-    }
-
-    return {
-      score: Math.min(1, Math.max(0, parsed.score)),
-      reason: parsed.reason,
-    };
-  } catch {
-    return fallback;
+    logger.info('Assessment queued', {
+      taskId: task.taskId,
+      updateId: update.updateId,
+      messageId: result.MessageId,
+    });
+  } catch (error) {
+    logger.error('Failed to queue assessment', {
+      taskId: task.taskId,
+      updateId: update.updateId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
   }
+}
+
+/**
+ * Legacy synchronous assessment - kept for backwards compatibility
+ * @deprecated Use queueAssessment instead
+ */
+export async function assessUpdate(
+  task: Task,
+  update: TaskUpdate,
+  currentDepth: number,
+): Promise<AssessmentResult> {
+  // For now, queue the assessment and return a default pending result
+  await queueAssessment(task, update, currentDepth);
+
+  return {
+    approved: false,
+    aiNotes: 'Assessment pending - will be processed asynchronously',
+    confidence: 0,
+  };
 }

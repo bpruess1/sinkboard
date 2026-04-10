@@ -1,0 +1,88 @@
+name: Deploy Staging
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm test
+
+  deploy-backend:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: us-east-1
+      - run: npm ci
+      - run: npm run build:shared
+      - run: npm run build:backend
+      - name: Deploy backend stack
+        run: npx cdk deploy SinkBoard-Staging-Backend --require-approval never
+        env:
+          ENVIRONMENT: staging
+        working-directory: infra
+
+  deploy-frontend:
+    needs: deploy-backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: us-east-1
+      - run: npm ci
+      - run: npm run build:shared
+      - name: Build frontend
+        run: npm run build -w @sink-board/frontend
+        env:
+          VITE_API_URL: ${{ vars.STAGING_API_URL }}
+          VITE_GOOGLE_CLIENT_ID: ${{ vars.STAGING_GOOGLE_CLIENT_ID }}
+      - name: Deploy frontend stack
+        run: npx cdk deploy SinkBoard-Staging-Frontend --require-approval never
+        env:
+          ENVIRONMENT: staging
+        working-directory: infra
+      - name: Upload to S3
+        run: aws s3 sync frontend/dist/ s3://${{ vars.STAGING_S3_BUCKET_NAME }} --delete
+
+  smoke-tests:
+    needs: deploy-frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run smoke tests
+        run: npm run test:smoke
+        env:
+          SMOKE_TEST_URL: ${{ vars.STAGING_API_URL }}
+          SMOKE_TEST_FRONTEND_URL: https://staging.sinkboard.com
+          SMOKE_TEST_TOKEN: ${{ secrets.STAGING_SMOKE_TEST_TOKEN }}

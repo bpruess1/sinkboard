@@ -1,44 +1,45 @@
 #!/usr/bin/env node
-import 'source-map-support/register.js';
+import 'source-map-support/register';
 import * as cdk from 'aws-cdk-lib';
-import { DnsStack } from '../lib/dns-stack.js';
-import { AuthStack } from '../lib/auth-stack.js';
-import { ApiStack } from '../lib/api-stack.js';
+import { BackendStack } from '../lib/backend-stack.js';
 import { FrontendStack } from '../lib/frontend-stack.js';
 
 const app = new cdk.App();
 
-const env = {
-  account: '418295677815',
-  region: 'us-west-1',
-};
+const ENVIRONMENT = process.env.ENVIRONMENT || 'staging';
+const IS_PRODUCTION = ENVIRONMENT === 'production';
 
-// Certificate for CloudFront must be in us-east-1
-const certEnv = {
-  account: '418295677815',
-  region: 'us-east-1',
-};
+const ACCOUNT = process.env.CDK_DEFAULT_ACCOUNT!;
+const REGION = process.env.CDK_DEFAULT_REGION || 'us-east-1';
 
-const dnsStack = new DnsStack(app, 'SinkBoard-Dns', {
-  env: certEnv,
-  crossRegionReferences: true,
-});
+const env = { account: ACCOUNT, region: REGION };
 
-const authStack = new AuthStack(app, 'SinkBoard-Auth', {
+const stackPrefix = IS_PRODUCTION ? 'SinkBoard-Prod' : 'SinkBoard-Staging';
+const domainName = IS_PRODUCTION ? 'sinkboard.com' : 'staging.sinkboard.com';
+
+const backendStack = new BackendStack(app, `${stackPrefix}-Backend`, {
   env,
+  stackName: `${stackPrefix}-Backend`,
+  description: `Sink Board ${ENVIRONMENT} backend infrastructure`,
+  tags: {
+    Environment: ENVIRONMENT,
+    Project: 'SinkBoard',
+    ManagedBy: 'CDK',
+  },
 });
 
-const apiStack = new ApiStack(app, 'SinkBoard-Api', {
+const frontendStack = new FrontendStack(app, `${stackPrefix}-Frontend`, {
   env,
-  userPool: authStack.userPool,
-  userPoolClient: authStack.userPoolClient,
+  stackName: `${stackPrefix}-Frontend`,
+  description: `Sink Board ${ENVIRONMENT} frontend infrastructure`,
+  domainName,
+  tags: {
+    Environment: ENVIRONMENT,
+    Project: 'SinkBoard',
+    ManagedBy: 'CDK',
+  },
 });
 
-const frontendStack = new FrontendStack(app, 'SinkBoard-Frontend', {
-  env,
-  crossRegionReferences: true,
-  hostedZone: dnsStack.hostedZone,
-  certificate: dnsStack.certificate,
-});
+frontendStack.addDependency(backendStack);
 
 app.synth();

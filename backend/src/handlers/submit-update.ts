@@ -1,153 +1,157 @@
-import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import crypto from 'node:crypto';
-import { getUserId } from '../middleware/auth.js';
-import { validateBody } from '../middleware/validation.js';
-import {
-  getTask,
-  updateTaskAfterRaise,
-  putTaskUpdate,
-} from '../services/dynamo.js';
-import { assessUpdate } from '../services/ai-assessor.js';
-import { SubmitUpdateRequestSchema } from '../schemas/update.js';
-import {
-  calculateCurrentDepth,
-  calculateRaisePercentage,
-  TIER_VALUES,
-} from '@sink-board/shared';
-import type { SubmitUpdateRequest, TaskUpdate, TaskStatus } from '@sink-board/shared';
-import { logger } from '../utils/logger.js';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { BedrockRuntimeClient, InvokeModelCommand } from '@aws-sdk/client-bedrock-runtime';
+import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
+import { logger } from '../utils/logger';
+import { AppError } from '../middleware/error-handler';
 
-const DEFAULT_ASSESSMENT_SCORE = 29;
+const TABLE_NAME = process.env.TABLE_NAME!;
+const DEFAULT_SCORE = 29;
 
-export const handler = validateBody(
-  SubmitUpdateRequestSchema,
-  async (
-    event: APIGatewayProxyEventV2,
-    body: SubmitUpdateRequest,
-  ): Promise<APIGatewayProxyResultV2> => {
-    const userId = getUserId(event);
-    const taskId = event.pathParameters?.taskId;
+const dynamoClient = new DynamoDBClient({});
+const docClient = DynamoDBDocumentClient.from(dynamoClient);
+const bedrockClient = new BedrockRuntimeClient({ region: 'us-east-1' });
+
+interface SubmitUpdateRequest {
+  taskId: string;
+  updateText?: string;
+}
+
+interface Task {
+  taskId: string;
+  userId: string;
+  title: string;
+  description?: string;
+  status: string;
+}
+
+async function assessUpdate(task: Task, updateText: string): Promise<number> {
+  const prompt = `You are assessing the quality and progress of a task update.
+
+Task Title: ${task.title}
+Task Description: ${task.description || 'No description provided'}
+
+Update Text: ${updateText}
+
+Evaluate this update on a scale from 0-100 based on:
+1. Does it show meaningful progress toward completing the task?
+2. Is it specific and concrete rather than vague?
+3. Does it demonstrate actual work rather than just plans or intentions?
+
+Respond with ONLY a number between 0 and 100. No explanation.`;
+
+  const payload = {
+    anthropic_version: 'bedrock-2023-05-31',
+    max_tokens: 10,
+    messages: [
+      {
+        role: 'user',
+        content: prompt
+      }
+    ]
+  };
+
+  const command = new InvokeModelCommand({
+    modelId: 'anthropic.claude-3-haiku-20240307-v1:0',
+    contentType: 'application/json',
+    accept: 'application/json',
+    body: JSON.stringify(payload)
+  });
+
+  try {
+    const response = await bedrockClient.send(command);
+    const responseBody = JSON.parse(new TextDecoder().decode(response.body));
+    const scoreText = responseBody.content[0].text.trim();
+    const score = parseInt(scoreText, 10);
+
+    if (isNaN(score) || score < 0 || score > 100) {
+      logger.warn('Invalid score from LLM', { scoreText, taskId: task.taskId });
+      return DEFAULT_SCORE;
+    }
+
+    return score;
+  } catch (error) {
+    logger.error('Error calling Bedrock for assessment', { error, taskId: task.taskId });
+    return DEFAULT_SCORE;
+  }
+}
+
+export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
+  try {
+    const userId = event.requestContext.authorizer?.claims?.sub;
+    if (!userId) {
+      throw new AppError('Unauthorized', 401);
+    }
+
+    const body: SubmitUpdateRequest = JSON.parse(event.body || '{}');
+    const { taskId, updateText } = body;
 
     if (!taskId) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ error: 'Task ID is required' }),
-      };
+      throw new AppError('taskId is required', 400);
     }
 
-    const task = await getTask(taskId);
+    // Get the task
+    const getCommand = new GetCommand({
+      TableName: TABLE_NAME,
+      Key: { taskId }
+    });
 
-    if (!task) {
-      return {
-        statusCode: 404,
-        body: JSON.stringify({ error: 'Task not found' }),
-      };
+    const result = await docClient.send(getCommand);
+    if (!result.Item) {
+      throw new AppError('Task not found', 404);
     }
 
+    const task = result.Item as Task;
+
+    // Verify ownership
     if (task.userId !== userId) {
-      return {
-        statusCode: 403,
-        body: JSON.stringify({ error: 'Forbidden' }),
-      };
+      throw new AppError('Forbidden', 403);
     }
 
-    if (task.status === 'completed') {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ error: 'Task is already completed' }),
-      };
-    }
+    let score: number;
 
-    const updateId = crypto.randomUUID();
-    const now = new Date().toISOString();
-
-    let assessmentScore: number;
-    let assessmentFeedback: string | undefined;
-    let newStatus: TaskStatus;
-    let errorMessage: string | undefined;
-
-    try {
-      const assessment = await assessUpdate({
-        taskTitle: task.title,
-        taskDescription: task.description || '',
-        updateContent: body.content,
-        sizeTier: task.sizeTier,
-      });
-
-      assessmentScore = assessment.score;
-      assessmentFeedback = assessment.feedback;
-      newStatus = 'ready for review';
-    } catch (error) {
-      logger.error('Assessment scoring unavailable', {
-        taskId,
-        updateId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-
-      assessmentScore = DEFAULT_ASSESSMENT_SCORE;
-      assessmentFeedback = undefined;
-      newStatus = 'processing';
-      errorMessage = 'Assessment scoring is unavailable. Assigning default score.';
-    }
-
-    const taskUpdate: TaskUpdate = {
-      updateId,
-      taskId,
-      userId,
-      content: body.content,
-      hoursSpent: body.hoursSpent,
-      submittedAt: now,
-      assessmentScore,
-      assessmentFeedback,
-    };
-
-    await putTaskUpdate(taskUpdate);
-
-    const tierValue = TIER_VALUES[task.sizeTier];
-    const currentDepth = calculateCurrentDepth(
-      task.totalHoursSpent,
-      tierValue,
-      task.raiseHistory,
-    );
-
-    const newTotalHours = task.totalHoursSpent + body.hoursSpent;
-    const newDepth = calculateCurrentDepth(
-      newTotalHours,
-      tierValue,
-      task.raiseHistory,
-    );
-
-    const raisePercentage = calculateRaisePercentage(currentDepth, newDepth);
-
-    if (raisePercentage > 0) {
-      await updateTaskAfterRaise({
-        taskId,
-        userId,
-        hoursSpent: body.hoursSpent,
-        raisePercentage,
-        status: newStatus,
-      });
+    // Skip scoring entirely if no update text exists
+    if (!updateText || updateText.trim() === '') {
+      logger.info('No update text provided, skipping assessment', { taskId });
+      score = DEFAULT_SCORE;
     } else {
-      await updateTaskAfterRaise({
-        taskId,
-        userId,
-        hoursSpent: body.hoursSpent,
-        raisePercentage: 0,
-        status: newStatus,
-      });
+      // Perform full assessment with LLM
+      score = await assessUpdate(task, updateText);
+      logger.info('Update assessed', { taskId, score });
     }
 
-    const responseBody: { update: TaskUpdate; errorMessage?: string } = {
-      update: taskUpdate,
-    };
+    // Store the update with score
+    const updateCommand = new UpdateCommand({
+      TableName: TABLE_NAME,
+      Key: { taskId },
+      UpdateExpression: 'SET lastUpdate = :updateText, lastUpdateTime = :timestamp, score = :score',
+      ExpressionAttributeValues: {
+        ':updateText': updateText || '',
+        ':timestamp': new Date().toISOString(),
+        ':score': score
+      },
+      ReturnValues: 'ALL_NEW'
+    });
 
-    if (errorMessage) {
-      responseBody.errorMessage = errorMessage;
-    }
+    const updateResult = await docClient.send(updateCommand);
 
     return {
-      statusCode: 201,
-      body: JSON.stringify(responseBody),
+      statusCode: 200,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      },
+      body: JSON.stringify({
+        message: 'Update submitted successfully',
+        task: updateResult.Attributes,
+        score
+      })
     };
-  },
-);
+  } catch (error) {
+    if (error instanceof AppError) {
+      throw error;
+    }
+    logger.error('Error submitting update', { error });
+    throw new AppError('Internal server error', 500);
+  }
+};

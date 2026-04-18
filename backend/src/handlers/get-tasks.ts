@@ -1,48 +1,73 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { getUserId } from '../middleware/auth.js';
 import { getTasksForUser } from '../services/dynamo.js';
-import { calculateJewelLevel } from '../services/scoring.js';
-import { calculateCurrentDepth, TIER_SINK_RATE_PER_MS } from '@sink-board/shared';
-import type { Task } from '@sink-board/shared';
 
+const DEFAULT_LIMIT = 20;
+const MAX_LIMIT = 100;
+
+/**
+ * Lambda handler to retrieve paginated tasks for the authenticated user.
+ * 
+ * Query parameters:
+ * - limit: Number of tasks to return (default: 20, max: 100)
+ * - nextToken: Base64-encoded pagination token from previous response
+ * 
+ * Response format:
+ * {
+ *   tasks: Task[],
+ *   nextToken?: string  // Present if more results available
+ * }
+ * 
+ * @param event - API Gateway event with authentication context
+ * @returns Paginated list of tasks with optional nextToken
+ */
 export const handler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   try {
     const userId = getUserId(event);
-    const tasks = await getTasksForUser(userId);
 
-    const enriched = tasks.map((task: Task) => ({
-      ...task,
-      jewelLevel: calculateJewelLevel(task.createdAt, task.krakenCount),
-      currentDepthPercent:
-        task.status === 'active'
-          ? calculateCurrentDepth(
-              task.currentDepthPercent,
-              task.lastRaisedAt,
-              TIER_SINK_RATE_PER_MS[task.sizeTier],
-            )
-          : task.currentDepthPercent,
-    }));
+    // Parse pagination parameters
+    const limitParam = event.queryStringParameters?.limit;
+    const nextTokenParam = event.queryStringParameters?.nextToken;
+
+    let limit = DEFAULT_LIMIT;
+    if (limitParam) {
+      const parsedLimit = parseInt(limitParam, 10);
+      if (!isNaN(parsedLimit) && parsedLimit > 0) {
+        limit = Math.min(parsedLimit, MAX_LIMIT);
+      }
+    }
+
+    // Decode nextToken if provided
+    let lastEvaluatedKey: Record<string, any> | undefined;
+    if (nextTokenParam) {
+      try {
+        const decoded = Buffer.from(nextTokenParam, 'base64').toString('utf-8');
+        lastEvaluatedKey = JSON.parse(decoded);
+      } catch (error) {
+        return {
+          statusCode: 400,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ error: 'Invalid nextToken format' }),
+        };
+      }
+    }
+
+    // Query tasks with pagination
+    const result = await getTasksForUser(userId, limit, lastEvaluatedKey);
 
     return {
       statusCode: 200,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(enriched),
+      body: JSON.stringify(result),
     };
-  } catch (err: any) {
-    if (err.statusCode === 401) {
-      return {
-        statusCode: 401,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ error: err.message }),
-      };
-    }
-    console.error('get-tasks error', err);
+  } catch (error) {
+    console.error('Error fetching tasks:', error);
     return {
       statusCode: 500,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ error: 'Internal server error' }),
+      body: JSON.stringify({ error: 'Failed to fetch tasks' }),
     };
   }
 };

@@ -1,42 +1,30 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import crypto from 'node:crypto';
 import { getUserId } from '../middleware/auth.js';
 import { validateBody } from '../middleware/validation.js';
-import {
-  getTask,
-  updateTaskAfterRaise,
-  putTaskUpdate,
-} from '../services/dynamo.js';
-import { assessUpdate } from '../services/ai-assessor.js';
+import { getTask, putUpdate } from '../services/dynamo.js';
 import { SubmitUpdateRequestSchema } from '../schemas/update.js';
-import {
-  calculateCurrentDepth,
-  calculateRaisePercentage,
-  TIER_VALUES,
-} from '@sink-board/shared';
-import type { SubmitUpdateRequest, TaskUpdate, TaskStatus } from '@sink-board/shared';
+import { assessUpdate } from '../services/assessment.js';
+import { checkAuthorization } from '../middleware/authorization.js';
 import { logger } from '../utils/logger.js';
-
-const DEFAULT_ASSESSMENT_SCORE = 29;
+import type { SubmitUpdateRequest, Update } from '@sink-board/shared';
 
 export const handler = validateBody(
   SubmitUpdateRequestSchema,
-  async (
-    event: APIGatewayProxyEventV2,
-    body: SubmitUpdateRequest,
-  ): Promise<APIGatewayProxyResultV2> => {
+  async (event: APIGatewayProxyEventV2): Promise<APIGatewayProxyResultV2> => {
     const userId = getUserId(event);
-    const taskId = event.pathParameters?.taskId;
+    const { taskId } = event.pathParameters || {};
 
     if (!taskId) {
       return {
         statusCode: 400,
-        body: JSON.stringify({ error: 'Task ID is required' }),
+        body: JSON.stringify({ error: 'Missing taskId' }),
       };
     }
 
-    const task = await getTask(taskId);
+    const body = JSON.parse(event.body!) as SubmitUpdateRequest;
 
+    // Get task and verify authorization
+    const task = await getTask(taskId);
     if (!task) {
       return {
         statusCode: 404,
@@ -44,110 +32,44 @@ export const handler = validateBody(
       };
     }
 
-    if (task.userId !== userId) {
-      return {
-        statusCode: 403,
-        body: JSON.stringify({ error: 'Forbidden' }),
-      };
+    const authResult = checkAuthorization(userId, task);
+    if (authResult) {
+      return authResult;
     }
 
-    if (task.status === 'completed') {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ error: 'Task is already completed' }),
-      };
-    }
+    // Get previous updates for context
+    const previousUpdates = task.updates || [];
 
-    const updateId = crypto.randomUUID();
-    const now = new Date().toISOString();
+    // Assess the update using LLM
+    const assessment = await assessUpdate(task, body.text, previousUpdates);
 
-    let assessmentScore: number;
-    let assessmentFeedback: string | undefined;
-    let newStatus: TaskStatus;
-    let errorMessage: string | undefined;
+    const update: Update = {
+      timestamp: new Date().toISOString(),
+      text: body.text,
+      score: assessment.score,
+      reasoning: assessment.reasoning,
+    };
 
-    try {
-      const assessment = await assessUpdate({
-        taskTitle: task.title,
-        taskDescription: task.description || '',
-        updateContent: body.content,
-        sizeTier: task.sizeTier,
-      });
-
-      assessmentScore = assessment.score;
-      assessmentFeedback = assessment.feedback;
-      newStatus = 'ready for review';
-    } catch (error) {
-      logger.error('Assessment scoring unavailable', {
-        taskId,
-        updateId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-
-      assessmentScore = DEFAULT_ASSESSMENT_SCORE;
-      assessmentFeedback = undefined;
-      newStatus = 'processing';
-      errorMessage = 'Assessment scoring is unavailable. Assigning default score.';
-    }
-
-    const taskUpdate: TaskUpdate = {
-      updateId,
+    logger.info('Submitting update with assessment', {
       taskId,
       userId,
-      content: body.content,
-      hoursSpent: body.hoursSpent,
-      submittedAt: now,
-      assessmentScore,
-      assessmentFeedback,
-    };
+      hasText: !!body.text,
+      score: assessment.score,
+      meaningfulProgress: assessment.meaningfulProgress,
+    });
 
-    await putTaskUpdate(taskUpdate);
-
-    const tierValue = TIER_VALUES[task.sizeTier];
-    const currentDepth = calculateCurrentDepth(
-      task.totalHoursSpent,
-      tierValue,
-      task.raiseHistory,
-    );
-
-    const newTotalHours = task.totalHoursSpent + body.hoursSpent;
-    const newDepth = calculateCurrentDepth(
-      newTotalHours,
-      tierValue,
-      task.raiseHistory,
-    );
-
-    const raisePercentage = calculateRaisePercentage(currentDepth, newDepth);
-
-    if (raisePercentage > 0) {
-      await updateTaskAfterRaise({
-        taskId,
-        userId,
-        hoursSpent: body.hoursSpent,
-        raisePercentage,
-        status: newStatus,
-      });
-    } else {
-      await updateTaskAfterRaise({
-        taskId,
-        userId,
-        hoursSpent: body.hoursSpent,
-        raisePercentage: 0,
-        status: newStatus,
-      });
-    }
-
-    const responseBody: { update: TaskUpdate; errorMessage?: string } = {
-      update: taskUpdate,
-    };
-
-    if (errorMessage) {
-      responseBody.errorMessage = errorMessage;
-    }
+    await putUpdate(taskId, update);
 
     return {
-      statusCode: 201,
-      body: JSON.stringify(responseBody),
+      statusCode: 200,
+      body: JSON.stringify({
+        update,
+        assessment: {
+          score: assessment.score,
+          meaningfulProgress: assessment.meaningfulProgress,
+          reasoning: assessment.reasoning,
+        },
+      }),
     };
-  },
+  }
 );
